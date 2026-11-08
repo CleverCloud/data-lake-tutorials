@@ -1,0 +1,51 @@
+# The number of Trino workers follows their CPU: more workers when they are busy, fewer when they
+# are idle. maxReplicas is the ceiling, whatever the load.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: trino-worker
+  namespace: lake
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: trino-worker
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 60}
+  behavior:
+    # At most one more worker a minute, and one fewer a minute once the load has been gone for a
+    # minute: the count follows the load without swinging with each query.
+    scaleUp:
+      policies: [{type: Pods, value: 1, periodSeconds: 60}]
+    scaleDown:
+      stabilizationWindowSeconds: 60
+      policies: [{type: Pods, value: 1, periodSeconds: 60}]
+---
+# The ceiling for everything in the namespace: Lakekeeper, Trino, and the jobs.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: lake
+  namespace: lake
+spec:
+  hard:
+    requests.cpu: "12"
+    requests.memory: 24Gi
+    pods: "15"
+---
+# A default request for the pods that state none, so that the quota accepts them. No default limit:
+# each pod sets its own.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+  namespace: lake
+spec:
+  limits:
+    - type: Container
+      defaultRequest: {cpu: 100m, memory: 128Mi}

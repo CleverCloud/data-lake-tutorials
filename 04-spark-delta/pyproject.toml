@@ -1,0 +1,18 @@
+[project]
+name = "spark-delta"
+version = "0.1.0"
+description = "Delta Lake tables on Cellar, written by Spark on Clever Kubernetes Engine"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    # Spark runs in the cluster from its own image; locally it is only needed by the test.
+    "pyspark==4.2.0",
+    "delta-spark==4.4.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+pythonpath = ["."]

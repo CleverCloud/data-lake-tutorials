@@ -1,0 +1,79 @@
+# The Iceberg catalogue. Every engine asks it, over HTTP, which tables exist and where their current
+# metadata is, and commits through it: it accepts one commit at a time per table. Its state lives in
+# the catalogue's managed PostgreSQL. The pod itself is stateless: it can be replaced.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lakekeeper
+  namespace: lake
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: lakekeeper}
+  template:
+    metadata:
+      labels: {app: lakekeeper}
+      # Karpenter never moves the catalogue: every commit goes through it.
+      annotations: {karpenter.sh/do-not-disrupt: "true"}
+    spec:
+      # On the fixed node, which Karpenter does not remove.
+      nodeSelector: {clever-cloud.com/nodegroup: system}
+      initContainers:
+        # Creates or upgrades the catalogue's tables in PostgreSQL before the server starts.
+        - name: migrate
+          image: quay.io/lakekeeper/catalog:v0.14.2
+          args: ["migrate"]
+          env:
+            - name: LAKEKEEPER__PG_DATABASE_URL_READ
+              valueFrom: {secretKeyRef: {name: lakekeeper, key: catalog-uri}}
+            - name: LAKEKEEPER__PG_DATABASE_URL_WRITE
+              valueFrom: {secretKeyRef: {name: lakekeeper, key: catalog-uri}}
+            - name: LAKEKEEPER__PG_ENCRYPTION_KEY
+              valueFrom: {secretKeyRef: {name: lakekeeper, key: encryption-key}}
+      containers:
+        - name: lakekeeper
+          image: quay.io/lakekeeper/catalog:v0.14.2
+          args: ["serve"]
+          env:
+            - name: LAKEKEEPER__PG_DATABASE_URL_READ
+              valueFrom: {secretKeyRef: {name: lakekeeper, key: catalog-uri}}
+            - name: LAKEKEEPER__PG_DATABASE_URL_WRITE
+              valueFrom: {secretKeyRef: {name: lakekeeper, key: catalog-uri}}
+            - name: LAKEKEEPER__PG_ENCRYPTION_KEY
+              valueFrom: {secretKeyRef: {name: lakekeeper, key: encryption-key}}
+          ports:
+            - containerPort: 8181
+          readinessProbe:
+            httpGet: {path: /health, port: 8181}
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 500m, memory: 512Mi}
+            limits: {cpu: "1", memory: 512Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lakekeeper
+  namespace: lake
+spec:
+  selector: {app: lakekeeper}
+  ports:
+    - port: 8181
+---
+# Only Trino and the warehouse job reach the catalogue. Other clients go through `kubectl port-forward`,
+# which the cluster's credentials authenticate.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lakekeeper
+  namespace: lake
+spec:
+  podSelector:
+    matchLabels: {app: lakekeeper}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {lakekeeper-client: "true"}
+      ports:
+        - {port: 8181}

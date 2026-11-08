@@ -1,0 +1,17 @@
+[project]
+name = "spark-iceberg"
+version = "0.1.0"
+description = "Iceberg tables on Cellar, recalculated in batches by Spark on Clever Kubernetes Engine"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    # Spark runs in the cluster from its own image; locally it is only needed by the test.
+    "pyspark==4.1.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+pythonpath = ["."]

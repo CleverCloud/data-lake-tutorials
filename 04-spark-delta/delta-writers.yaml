@@ -1,0 +1,119 @@
+# Three Jobs of Spark Connect clients, applied one after the other with `-l step=<step>` (see the README):
+# delta-init creates the table, delta-writers runs two writers at the same time, delta-check counts.
+# Each pod installs pyspark-client first, which takes about a minute.
+# Each pod carries the label delta-writer: "true", which the server's NetworkPolicy lets in.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: delta-init
+  namespace: delta
+  labels: {step: init}
+spec:
+  # Safe to run again: init replaces the rows, check only reads. A pod that starts while the
+  # server restarts gets another try. The writers get none: a retry would write their rows twice.
+  backoffLimit: 3
+  template:
+    metadata:
+      labels: {delta-writer: "true"}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: client
+          image: python:3.13-slim
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          envFrom:
+            # The bucket's name only: the writers need no Cellar key.
+            - configMapRef: {name: lake-settings}
+          env:
+            - {name: SPARK_REMOTE, value: "sc://spark-connect:15002"}
+            - {name: WRITERS, value: "2"}
+            - {name: COMMITS, value: "10"}
+          # A thin client: Python and pyspark-client, no Java and no Spark in the pod.
+          command: ["sh", "-c", "pip install --quiet --root-user-action=ignore pyspark-client==4.2.0 && python /jobs/delta_client.py init"]
+          volumeMounts:
+            - name: jobs
+              mountPath: /jobs
+      volumes:
+        - name: jobs
+          configMap:
+            name: clients
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: delta-writers
+  namespace: delta
+  labels: {step: write}
+spec:
+  # Two pods at the same time, writers 1 and 2, from JOB_COMPLETION_INDEX.
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {delta-writer: "true"}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: client
+          image: python:3.13-slim
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          envFrom:
+            # The bucket's name only: the writers need no Cellar key.
+            - configMapRef: {name: lake-settings}
+          env:
+            - {name: SPARK_REMOTE, value: "sc://spark-connect:15002"}
+            - {name: WRITERS, value: "2"}
+            - {name: COMMITS, value: "10"}
+          # A thin client: Python and pyspark-client, no Java and no Spark in the pod.
+          command: ["sh", "-c", "pip install --quiet --root-user-action=ignore pyspark-client==4.2.0 && python /jobs/delta_client.py write"]
+          volumeMounts:
+            - name: jobs
+              mountPath: /jobs
+      volumes:
+        - name: jobs
+          configMap:
+            name: clients
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: delta-check
+  namespace: delta
+  labels: {step: check}
+spec:
+  # Safe to run again: init replaces the rows, check only reads. A pod that starts while the
+  # server restarts gets another try. The writers get none: a retry would write their rows twice.
+  backoffLimit: 3
+  template:
+    metadata:
+      labels: {delta-writer: "true"}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: client
+          image: python:3.13-slim
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          envFrom:
+            # The bucket's name only: the writers need no Cellar key.
+            - configMapRef: {name: lake-settings}
+          env:
+            - {name: SPARK_REMOTE, value: "sc://spark-connect:15002"}
+            - {name: WRITERS, value: "2"}
+            - {name: COMMITS, value: "10"}
+          # A thin client: Python and pyspark-client, no Java and no Spark in the pod.
+          command: ["sh", "-c", "pip install --quiet --root-user-action=ignore pyspark-client==4.2.0 && python /jobs/delta_client.py check"]
+          volumeMounts:
+            - name: jobs
+              mountPath: /jobs
+      volumes:
+        - name: jobs
+          configMap:
+            name: clients

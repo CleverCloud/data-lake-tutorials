@@ -1,0 +1,14 @@
+# The business database, as a catalogue of Trino. A query joins it with the lake. Apply this file
+# when the business database exists (see the README): Trino reads its address, user and password
+# from the trino secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-business
+  namespace: lake
+data:
+  business.properties: |
+    connector.name=postgresql
+    connection-url=${ENV:BUSINESS_JDBC_URL}
+    connection-user=${ENV:BUSINESS_USER}
+    connection-password=${ENV:BUSINESS_PASSWORD}

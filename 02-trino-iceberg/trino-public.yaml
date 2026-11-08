@@ -1,0 +1,13 @@
+# The clients' entry point: a LoadBalancer Service, which Kubernetes Engine turns into a load
+# balancer dedicated to this Service, with its own public addresses. It forwards TCP to the
+# coordinator's HTTPS port: Trino itself serves TLS and checks the passwords.
+apiVersion: v1
+kind: Service
+metadata:
+  name: trino-public
+  namespace: lake
+spec:
+  type: LoadBalancer
+  selector: {app: trino-coordinator}
+  ports:
+    - {name: https, port: 443, targetPort: 8443}

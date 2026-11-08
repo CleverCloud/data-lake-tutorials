@@ -1,0 +1,59 @@
+# The nodes Karpenter may add for the Spark executors. Karpenter picks the Clever Cloud instance size that
+# fits the waiting pods, and removes a node 30 seconds after it is empty or underused.
+#
+# The limits are the ceiling on what Karpenter adds, whatever the load: beyond them, new executors
+# wait as Pending and no node is created. They stay under the organisation's quota, which the
+# control plane and the fixed node already use in part.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: spark-executors
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.clever-cloud.com
+        kind: CleverNodeClass
+        name: spark-executors
+      requirements:
+        - {key: kubernetes.io/arch, operator: In, values: ["amd64"]}
+        - {key: kubernetes.io/os, operator: In, values: ["linux"]}
+        - {key: karpenter.sh/capacity-type, operator: In, values: ["on-demand"]}
+      expireAfter: Never
+  limits:
+    cpu: "16"
+    memory: 16Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+---
+apiVersion: karpenter.clever-cloud.com/v1alpha1
+kind: CleverNodeClass
+metadata:
+  name: spark-executors
+spec:
+  labels: {}
+---
+# The ceiling for everything in the namespace: drivers, executors and jobs.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: spark
+  namespace: delta
+spec:
+  hard:
+    requests.cpu: "14"
+    requests.memory: 24Gi
+    pods: "20"
+---
+# A default request for the pods that state none, so that the quota accepts them. No default limit:
+# Spark sets its executors' own.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+  namespace: delta
+spec:
+  limits:
+    - type: Container
+      defaultRequest: {cpu: 100m, memory: 128Mi}

@@ -1,0 +1,13 @@
+[project]
+name = "trino-iceberg"
+version = "0.1.0"
+description = "Runs SQL on Trino through its dedicated load balancer"
+requires-python = ">=3.12"
+dependencies = ["trino==0.340.0"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+pythonpath = ["."]

@@ -1,0 +1,35 @@
+# The nodes Karpenter may add for the Trino workers. Karpenter picks the Clever Cloud instance size that
+# fits the waiting pods, and removes a node 30 seconds after it is empty or underused.
+#
+# The limits are the ceiling on what Karpenter adds, whatever the load: beyond them, new workers
+# wait as Pending and no node is created. They stay under the organisation's quota, which the
+# control plane and the fixed node already use in part.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: trino-workers
+spec:
+  template:
+    spec:
+      nodeClassRef:
+        group: karpenter.clever-cloud.com
+        kind: CleverNodeClass
+        name: trino-workers
+      requirements:
+        - {key: kubernetes.io/arch, operator: In, values: ["amd64"]}
+        - {key: kubernetes.io/os, operator: In, values: ["linux"]}
+        - {key: karpenter.sh/capacity-type, operator: In, values: ["on-demand"]}
+      expireAfter: Never
+  limits:
+    cpu: "16"
+    memory: 16Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+---
+apiVersion: karpenter.clever-cloud.com/v1alpha1
+kind: CleverNodeClass
+metadata:
+  name: trino-workers
+spec:
+  labels: {}

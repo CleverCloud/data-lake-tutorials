@@ -1,0 +1,60 @@
+# Bootstraps the catalogue and declares the warehouse: the bucket, the prefix, and the Cellar keys
+# the catalogue uses to check it can write there. The catalogue neither hands out keys nor signs
+# requests for the engines: each engine reads and writes the lake with the keys of its own secret.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: warehouse
+  namespace: catalog
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels: {lakekeeper-client: "true"}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: create
+          image: curlimages/curl:8.22.0
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+          envFrom:
+            - secretRef: {name: warehouse}
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              base=http://lakekeeper:8181/management/v1
+              # The catalogue is bootstrapped once. A second bootstrap answers 400 CatalogAlreadyBootstrapped,
+              # so the job reads the server's state first and skips the step when it is done.
+              if curl -sS "$base/info" | grep -q '"bootstrapped":true'; then
+                echo "bootstrap: already done"
+              else
+                code=$(curl -sS -o /tmp/answer -w '%{http_code}' -X POST "$base/bootstrap" \
+                  -H 'content-type: application/json' -d '{"accept-terms-of-use": true}')
+                echo "bootstrap: $code"
+                [ "$code" = 204 ] || { cat /tmp/answer; exit 1; }
+              fi
+              # 201 when created. A rerun answers 400 StorageProfileOverlap: the warehouse is already
+              # declared on this bucket. Anything else means Lakekeeper refused it, for instance because
+              # it could not write its test file to the bucket.
+              code=$(curl -sS -o /tmp/answer -w '%{http_code}' -X POST "$base/warehouse" \
+                -H 'content-type: application/json' -d "{
+                \"warehouse-name\": \"lake\",
+                \"storage-profile\": {
+                  \"type\": \"s3\", \"bucket\": \"$LAKE_BUCKET\", \"key-prefix\": \"warehouse\",
+                  \"endpoint\": \"https://$CELLAR_HOST\", \"region\": \"us-east-1\",
+                  \"path-style-access\": true, \"flavor\": \"s3-compat\", \"sts-enabled\": false, \"remote-signing-enabled\": false
+                },
+                \"storage-credential\": {
+                  \"type\": \"s3\", \"credential-type\": \"access-key\",
+                  \"aws-access-key-id\": \"$LAKE_KEY_ID\", \"aws-secret-access-key\": \"$LAKE_KEY_SECRET\"
+                }
+              }")
+              if grep -q StorageProfileOverlap /tmp/answer; then
+                echo "warehouse: already declared"
+              else
+                echo "warehouse: $code"
+                [ "$code" = 201 ] || { cat /tmp/answer; exit 1; }
+              fi

@@ -1,0 +1,365 @@
+# Four Spark Jobs on the Iceberg table, applied one at a time with `-l step=<step>` (see the README):
+# iceberg-init creates the table, iceberg-writers runs two writers at the same time, each its own
+# driver with its executors, and iceberg-check counts. iceberg-compute is a CPU batch that shows the
+# executors following the work. Each driver runs in client mode: it
+# asks Kubernetes for its executors itself. The pods carry the label lakekeeper-client: "true",
+# which the catalogue's NetworkPolicy lets in.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: iceberg-init
+  namespace: batch
+  labels: {step: init}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {lakekeeper-client: "true"}
+      # Karpenter never moves a running driver: the batch would fail with it.
+      annotations: {karpenter.sh/do-not-disrupt: "true"}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: spark
+      containers:
+        - name: driver
+          image: apache/spark:4.1.4-python3
+          env:
+            # Cellar's address and keys, from the secret created in the README's step 2. The keys are
+            # read from the environment by the S3 clients, and never appear in Spark's configuration.
+            - name: CELLAR_HOST
+              valueFrom: {secretKeyRef: {name: spark, key: CELLAR_HOST}}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: {secretKeyRef: {name: spark, key: CELLAR_KEY_ID}}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: spark, key: CELLAR_KEY_SECRET}}
+            # The catalogue runs in its own namespace, catalog.
+            - {name: LAKEKEEPER_URI, value: "http://lakekeeper.catalog.svc:8181/catalog"}
+            - {name: WRITERS, value: "2"}
+            - {name: COMMITS, value: "10"}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: HOME, value: /tmp}
+            # Cellar refuses the checksums the AWS SDK adds by default: send them only when required.
+            - {name: AWS_REQUEST_CHECKSUM_CALCULATION, value: when_required}
+            - {name: AWS_RESPONSE_CHECKSUM_VALIDATION, value: when_required}
+          command: ["/opt/spark/bin/spark-submit"]
+          args:
+            - --master=k8s://https://kubernetes.default.svc
+            - --deploy-mode=client
+            - --name=iceberg-init
+            - --conf=spark.kubernetes.namespace=batch
+            - --conf=spark.kubernetes.container.image=apache/spark:4.1.4-python3
+            - --conf=spark.kubernetes.authenticate.driver.serviceAccountName=spark
+            - --conf=spark.driver.host=$(POD_IP)
+            # The executors belong to this pod: Kubernetes deletes them with it.
+            - --conf=spark.kubernetes.driver.pod.name=$(POD_NAME)
+            - --conf=spark.driver.port=7078
+            - --conf=spark.driver.blockManager.port=7079
+            - --conf=spark.driver.memory=1g
+            # Dynamic allocation: the driver asks for executors while tasks wait, at most 6, and gives
+            # back an executor idle for 30 seconds. Shuffle tracking keeps the executors that hold data.
+            - --conf=spark.dynamicAllocation.enabled=true
+            - --conf=spark.dynamicAllocation.shuffleTracking.enabled=true
+            - --conf=spark.dynamicAllocation.minExecutors=0
+            - --conf=spark.dynamicAllocation.maxExecutors=6
+            - --conf=spark.dynamicAllocation.executorIdleTimeout=30s
+            - --conf=spark.executor.cores=2
+            - --conf=spark.executor.memory=2g
+            # Iceberg for Spark 4.1 and its S3 client, which writes the tables' files on Cellar. Hadoop's
+            # S3 connector, of Hadoop 3.4.2 as Spark 4.1 is built with, reads other files there: s3a://.
+            - --conf=spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.12.0,org.apache.iceberg:iceberg-aws-bundle:1.12.0,org.apache.hadoop:hadoop-aws:3.4.2
+            - --conf=spark.jars.ivy=/tmp/.ivy2
+            - --conf=spark.executorEnv.AWS_REQUEST_CHECKSUM_CALCULATION=when_required
+            - --conf=spark.executorEnv.AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+            # The executors get the same keys from the same secret, by reference.
+            - --conf=spark.kubernetes.executor.secretKeyRef.AWS_ACCESS_KEY_ID=spark:CELLAR_KEY_ID
+            - --conf=spark.kubernetes.executor.secretKeyRef.AWS_SECRET_ACCESS_KEY=spark:CELLAR_KEY_SECRET
+            # The driver and its executors authenticate each other with a secret Spark generates for
+            # each Job, and encrypt what they exchange: no other pod joins the Job.
+            - --conf=spark.authenticate=true
+            - --conf=spark.network.crypto.enabled=true
+            - /jobs/iceberg_job.py
+            - init
+          volumeMounts:
+            - name: jobs
+              mountPath: /jobs
+          resources:
+            requests: {cpu: "1", memory: 2Gi}
+            limits: {cpu: "1", memory: 2Gi}
+      volumes:
+        - name: jobs
+          configMap:
+            name: jobs
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: iceberg-writers
+  namespace: batch
+  labels: {step: write}
+spec:
+  # Two drivers at the same time, writers 1 and 2, from JOB_COMPLETION_INDEX.
+  completions: 2
+  parallelism: 2
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {lakekeeper-client: "true"}
+      # Karpenter never moves a running driver: the batch would fail with it.
+      annotations: {karpenter.sh/do-not-disrupt: "true"}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: spark
+      containers:
+        - name: driver
+          image: apache/spark:4.1.4-python3
+          env:
+            # Cellar's address and keys, from the secret created in the README's step 2. The keys are
+            # read from the environment by the S3 clients, and never appear in Spark's configuration.
+            - name: CELLAR_HOST
+              valueFrom: {secretKeyRef: {name: spark, key: CELLAR_HOST}}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: {secretKeyRef: {name: spark, key: CELLAR_KEY_ID}}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: spark, key: CELLAR_KEY_SECRET}}
+            # The catalogue runs in its own namespace, catalog.
+            - {name: LAKEKEEPER_URI, value: "http://lakekeeper.catalog.svc:8181/catalog"}
+            - {name: WRITERS, value: "2"}
+            - {name: COMMITS, value: "10"}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: HOME, value: /tmp}
+            # Cellar refuses the checksums the AWS SDK adds by default: send them only when required.
+            - {name: AWS_REQUEST_CHECKSUM_CALCULATION, value: when_required}
+            - {name: AWS_RESPONSE_CHECKSUM_VALIDATION, value: when_required}
+          command: ["/opt/spark/bin/spark-submit"]
+          args:
+            - --master=k8s://https://kubernetes.default.svc
+            - --deploy-mode=client
+            - --name=iceberg-writers
+            - --conf=spark.kubernetes.namespace=batch
+            - --conf=spark.kubernetes.container.image=apache/spark:4.1.4-python3
+            - --conf=spark.kubernetes.authenticate.driver.serviceAccountName=spark
+            - --conf=spark.driver.host=$(POD_IP)
+            # The executors belong to this pod: Kubernetes deletes them with it.
+            - --conf=spark.kubernetes.driver.pod.name=$(POD_NAME)
+            - --conf=spark.driver.port=7078
+            - --conf=spark.driver.blockManager.port=7079
+            - --conf=spark.driver.memory=1g
+            # Dynamic allocation: the driver asks for executors while tasks wait, at most 6, and gives
+            # back an executor idle for 30 seconds. Shuffle tracking keeps the executors that hold data.
+            - --conf=spark.dynamicAllocation.enabled=true
+            - --conf=spark.dynamicAllocation.shuffleTracking.enabled=true
+            - --conf=spark.dynamicAllocation.minExecutors=0
+            - --conf=spark.dynamicAllocation.maxExecutors=6
+            - --conf=spark.dynamicAllocation.executorIdleTimeout=30s
+            - --conf=spark.executor.cores=2
+            - --conf=spark.executor.memory=2g
+            # Iceberg for Spark 4.1 and its S3 client, which writes the tables' files on Cellar. Hadoop's
+            # S3 connector, of Hadoop 3.4.2 as Spark 4.1 is built with, reads other files there: s3a://.
+            - --conf=spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.12.0,org.apache.iceberg:iceberg-aws-bundle:1.12.0,org.apache.hadoop:hadoop-aws:3.4.2
+            - --conf=spark.jars.ivy=/tmp/.ivy2
+            - --conf=spark.executorEnv.AWS_REQUEST_CHECKSUM_CALCULATION=when_required
+            - --conf=spark.executorEnv.AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+            # The executors get the same keys from the same secret, by reference.
+            - --conf=spark.kubernetes.executor.secretKeyRef.AWS_ACCESS_KEY_ID=spark:CELLAR_KEY_ID
+            - --conf=spark.kubernetes.executor.secretKeyRef.AWS_SECRET_ACCESS_KEY=spark:CELLAR_KEY_SECRET
+            # The driver and its executors authenticate each other with a secret Spark generates for
+            # each Job, and encrypt what they exchange: no other pod joins the Job.
+            - --conf=spark.authenticate=true
+            - --conf=spark.network.crypto.enabled=true
+            - /jobs/iceberg_job.py
+            - write
+          volumeMounts:
+            - name: jobs
+              mountPath: /jobs
+          resources:
+            requests: {cpu: "1", memory: 2Gi}
+            limits: {cpu: "1", memory: 2Gi}
+      volumes:
+        - name: jobs
+          configMap:
+            name: jobs
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: iceberg-check
+  namespace: batch
+  labels: {step: check}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {lakekeeper-client: "true"}
+      # Karpenter never moves a running driver: the batch would fail with it.
+      annotations: {karpenter.sh/do-not-disrupt: "true"}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: spark
+      containers:
+        - name: driver
+          image: apache/spark:4.1.4-python3
+          env:
+            # Cellar's address and keys, from the secret created in the README's step 2. The keys are
+            # read from the environment by the S3 clients, and never appear in Spark's configuration.
+            - name: CELLAR_HOST
+              valueFrom: {secretKeyRef: {name: spark, key: CELLAR_HOST}}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: {secretKeyRef: {name: spark, key: CELLAR_KEY_ID}}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: spark, key: CELLAR_KEY_SECRET}}
+            # The catalogue runs in its own namespace, catalog.
+            - {name: LAKEKEEPER_URI, value: "http://lakekeeper.catalog.svc:8181/catalog"}
+            - {name: WRITERS, value: "2"}
+            - {name: COMMITS, value: "10"}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: HOME, value: /tmp}
+            # Cellar refuses the checksums the AWS SDK adds by default: send them only when required.
+            - {name: AWS_REQUEST_CHECKSUM_CALCULATION, value: when_required}
+            - {name: AWS_RESPONSE_CHECKSUM_VALIDATION, value: when_required}
+          command: ["/opt/spark/bin/spark-submit"]
+          args:
+            - --master=k8s://https://kubernetes.default.svc
+            - --deploy-mode=client
+            - --name=iceberg-check
+            - --conf=spark.kubernetes.namespace=batch
+            - --conf=spark.kubernetes.container.image=apache/spark:4.1.4-python3
+            - --conf=spark.kubernetes.authenticate.driver.serviceAccountName=spark
+            - --conf=spark.driver.host=$(POD_IP)
+            # The executors belong to this pod: Kubernetes deletes them with it.
+            - --conf=spark.kubernetes.driver.pod.name=$(POD_NAME)
+            - --conf=spark.driver.port=7078
+            - --conf=spark.driver.blockManager.port=7079
+            - --conf=spark.driver.memory=1g
+            # Dynamic allocation: the driver asks for executors while tasks wait, at most 6, and gives
+            # back an executor idle for 30 seconds. Shuffle tracking keeps the executors that hold data.
+            - --conf=spark.dynamicAllocation.enabled=true
+            - --conf=spark.dynamicAllocation.shuffleTracking.enabled=true
+            - --conf=spark.dynamicAllocation.minExecutors=0
+            - --conf=spark.dynamicAllocation.maxExecutors=6
+            - --conf=spark.dynamicAllocation.executorIdleTimeout=30s
+            - --conf=spark.executor.cores=2
+            - --conf=spark.executor.memory=2g
+            # Iceberg for Spark 4.1 and its S3 client, which writes the tables' files on Cellar. Hadoop's
+            # S3 connector, of Hadoop 3.4.2 as Spark 4.1 is built with, reads other files there: s3a://.
+            - --conf=spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.12.0,org.apache.iceberg:iceberg-aws-bundle:1.12.0,org.apache.hadoop:hadoop-aws:3.4.2
+            - --conf=spark.jars.ivy=/tmp/.ivy2
+            - --conf=spark.executorEnv.AWS_REQUEST_CHECKSUM_CALCULATION=when_required
+            - --conf=spark.executorEnv.AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+            # The executors get the same keys from the same secret, by reference.
+            - --conf=spark.kubernetes.executor.secretKeyRef.AWS_ACCESS_KEY_ID=spark:CELLAR_KEY_ID
+            - --conf=spark.kubernetes.executor.secretKeyRef.AWS_SECRET_ACCESS_KEY=spark:CELLAR_KEY_SECRET
+            # The driver and its executors authenticate each other with a secret Spark generates for
+            # each Job, and encrypt what they exchange: no other pod joins the Job.
+            - --conf=spark.authenticate=true
+            - --conf=spark.network.crypto.enabled=true
+            - /jobs/iceberg_job.py
+            - check
+          volumeMounts:
+            - name: jobs
+              mountPath: /jobs
+          resources:
+            requests: {cpu: "1", memory: 2Gi}
+            limits: {cpu: "1", memory: 2Gi}
+      volumes:
+        - name: jobs
+          configMap:
+            name: jobs
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: iceberg-compute
+  namespace: batch
+  labels: {step: compute}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {lakekeeper-client: "true"}
+      # Karpenter never moves a running driver: the batch would fail with it.
+      annotations: {karpenter.sh/do-not-disrupt: "true"}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: spark
+      containers:
+        - name: driver
+          image: apache/spark:4.1.4-python3
+          env:
+            # Cellar's address and keys, from the secret created in the README's step 2. The keys are
+            # read from the environment by the S3 clients, and never appear in Spark's configuration.
+            - name: CELLAR_HOST
+              valueFrom: {secretKeyRef: {name: spark, key: CELLAR_HOST}}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: {secretKeyRef: {name: spark, key: CELLAR_KEY_ID}}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: spark, key: CELLAR_KEY_SECRET}}
+            # The catalogue runs in its own namespace, catalog.
+            - {name: LAKEKEEPER_URI, value: "http://lakekeeper.catalog.svc:8181/catalog"}
+            - {name: WRITERS, value: "2"}
+            - {name: COMMITS, value: "10"}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: HOME, value: /tmp}
+            # Cellar refuses the checksums the AWS SDK adds by default: send them only when required.
+            - {name: AWS_REQUEST_CHECKSUM_CALCULATION, value: when_required}
+            - {name: AWS_RESPONSE_CHECKSUM_VALIDATION, value: when_required}
+          command: ["/opt/spark/bin/spark-submit"]
+          args:
+            - --master=k8s://https://kubernetes.default.svc
+            - --deploy-mode=client
+            - --name=iceberg-compute
+            - --conf=spark.kubernetes.namespace=batch
+            - --conf=spark.kubernetes.container.image=apache/spark:4.1.4-python3
+            - --conf=spark.kubernetes.authenticate.driver.serviceAccountName=spark
+            - --conf=spark.driver.host=$(POD_IP)
+            # The executors belong to this pod: Kubernetes deletes them with it.
+            - --conf=spark.kubernetes.driver.pod.name=$(POD_NAME)
+            - --conf=spark.driver.port=7078
+            - --conf=spark.driver.blockManager.port=7079
+            - --conf=spark.driver.memory=1g
+            # Dynamic allocation: the driver asks for executors while tasks wait, at most 6, and gives
+            # back an executor idle for 30 seconds. Shuffle tracking keeps the executors that hold data.
+            - --conf=spark.dynamicAllocation.enabled=true
+            - --conf=spark.dynamicAllocation.shuffleTracking.enabled=true
+            - --conf=spark.dynamicAllocation.minExecutors=0
+            - --conf=spark.dynamicAllocation.maxExecutors=6
+            - --conf=spark.dynamicAllocation.executorIdleTimeout=30s
+            - --conf=spark.executor.cores=2
+            - --conf=spark.executor.memory=2g
+            # Iceberg for Spark 4.1 and its S3 client, which writes the tables' files on Cellar. Hadoop's
+            # S3 connector, of Hadoop 3.4.2 as Spark 4.1 is built with, reads other files there: s3a://.
+            - --conf=spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.12.0,org.apache.iceberg:iceberg-aws-bundle:1.12.0,org.apache.hadoop:hadoop-aws:3.4.2
+            - --conf=spark.jars.ivy=/tmp/.ivy2
+            - --conf=spark.executorEnv.AWS_REQUEST_CHECKSUM_CALCULATION=when_required
+            - --conf=spark.executorEnv.AWS_RESPONSE_CHECKSUM_VALIDATION=when_required
+            # The executors get the same keys from the same secret, by reference.
+            - --conf=spark.kubernetes.executor.secretKeyRef.AWS_ACCESS_KEY_ID=spark:CELLAR_KEY_ID
+            - --conf=spark.kubernetes.executor.secretKeyRef.AWS_SECRET_ACCESS_KEY=spark:CELLAR_KEY_SECRET
+            # The driver and its executors authenticate each other with a secret Spark generates for
+            # each Job, and encrypt what they exchange: no other pod joins the Job.
+            - --conf=spark.authenticate=true
+            - --conf=spark.network.crypto.enabled=true
+            - /jobs/iceberg_job.py
+            - compute
+          volumeMounts:
+            - name: jobs
+              mountPath: /jobs
+          resources:
+            requests: {cpu: "1", memory: 2Gi}
+            limits: {cpu: "1", memory: 2Gi}
+      volumes:
+        - name: jobs
+          configMap:
+            name: jobs

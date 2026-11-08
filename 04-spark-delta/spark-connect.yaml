@@ -1,0 +1,130 @@
+# The Spark Connect server: the one Spark driver of the lake. Writers send it their queries over
+# Spark Connect, and it runs them on its executors, which it starts while there is work and gives
+# back when idle. Every write to a Delta table goes through this driver, which commits them one
+# after the other, so writers working at the same time lose nothing.
+#
+# The server is reachable inside the cluster only, and only from the pods labelled
+# `delta-writer: "true"`: the NetworkPolicy at the end of this file refuses every other pod.
+apiVersion: apps/v1
+# One driver, never two: a second one would commit to the same tables without seeing the first. A
+# StatefulSet starts the replacement pod only once the old one is gone, even when its node is lost.
+kind: StatefulSet
+metadata:
+  name: spark-connect
+  namespace: delta
+spec:
+  serviceName: spark-connect
+  replicas: 1
+  selector:
+    matchLabels: {app: spark-connect}
+  template:
+    metadata:
+      labels: {app: spark-connect}
+      # Karpenter never moves the server: every writer's session goes through it.
+      annotations: {karpenter.sh/do-not-disrupt: "true"}
+    spec:
+      # On the fixed node, which Karpenter does not remove.
+      nodeSelector: {clever-cloud.com/nodegroup: system}
+      serviceAccountName: spark
+      containers:
+        - name: driver
+          image: apache/spark:4.2.0-python3
+          env:
+            # Cellar's address, and its keys for Hadoop's S3 connector, which reads AWS_ACCESS_KEY_ID
+            # and AWS_SECRET_ACCESS_KEY. They come from the secret created in the README's step 2, and
+            # never appear on the command line or in the logs.
+            - name: CELLAR_HOST
+              valueFrom: {secretKeyRef: {name: lake, key: CELLAR_HOST}}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: {secretKeyRef: {name: lake, key: CELLAR_KEY_ID}}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: lake, key: CELLAR_KEY_SECRET}}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - {name: HOME, value: /tmp}
+            # Keeps the server in the foreground, so the container lives as long as the server.
+            - {name: SPARK_NO_DAEMONIZE, value: "true"}
+          command: ["/opt/spark/sbin/start-connect-server.sh"]
+          args:
+            - --master=k8s://https://kubernetes.default.svc
+            - --name=spark-connect
+            - --conf=spark.kubernetes.namespace=delta
+            - --conf=spark.kubernetes.container.image=apache/spark:4.2.0-python3
+            - --conf=spark.kubernetes.authenticate.driver.serviceAccountName=spark
+            - --conf=spark.driver.host=$(POD_IP)
+            # The executors belong to this pod: Kubernetes deletes them with it.
+            - --conf=spark.kubernetes.driver.pod.name=$(POD_NAME)
+            - --conf=spark.driver.port=7078
+            - --conf=spark.driver.blockManager.port=7079
+            - --conf=spark.driver.memory=1g
+            # Dynamic allocation: the server asks for executors while tasks wait, at most 4, and gives
+            # back an executor idle for 30 seconds. Shuffle tracking keeps an executor whose data a
+            # running query still needs.
+            - --conf=spark.dynamicAllocation.enabled=true
+            - --conf=spark.dynamicAllocation.shuffleTracking.enabled=true
+            - --conf=spark.dynamicAllocation.minExecutors=0
+            - --conf=spark.dynamicAllocation.maxExecutors=4
+            - --conf=spark.dynamicAllocation.executorIdleTimeout=30s
+            # The server stays up between writers: without these timeouts, an executor holding shuffle
+            # data or cached blocks from an earlier query, such as Delta's table states, would never be
+            # given back.
+            - --conf=spark.dynamicAllocation.shuffleTracking.timeout=30s
+            - --conf=spark.dynamicAllocation.cachedExecutorIdleTimeout=30s
+            - --conf=spark.executor.cores=2
+            - --conf=spark.executor.memory=2g
+            # Delta for Spark 4.2, and the S3 connector of Hadoop 3.5, the version Spark 4.2 is built with.
+            - --conf=spark.jars.packages=io.delta:delta-spark_4.2_2.13:4.4.1,org.apache.hadoop:hadoop-aws:3.5.0
+            - --conf=spark.jars.ivy=/tmp/.ivy2
+            - --conf=spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+            - --conf=spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+            # Cellar speaks the S3 API, with its own endpoint and path-style addresses.
+            - --conf=spark.hadoop.fs.s3a.endpoint=https://$(CELLAR_HOST)
+            - --conf=spark.hadoop.fs.s3a.endpoint.region=us-east-1
+            - --conf=spark.hadoop.fs.s3a.path.style.access=true
+            # The executors get the same keys from the same secret, by reference.
+            - --conf=spark.kubernetes.executor.secretKeyRef.AWS_ACCESS_KEY_ID=lake:CELLAR_KEY_ID
+            - --conf=spark.kubernetes.executor.secretKeyRef.AWS_SECRET_ACCESS_KEY=lake:CELLAR_KEY_SECRET
+            # The server and its executors authenticate each other with a secret Spark generates, and
+            # encrypt what they exchange: no other pod joins as an executor.
+            - --conf=spark.authenticate=true
+            - --conf=spark.network.crypto.enabled=true
+          ports:
+            - containerPort: 15002
+          readinessProbe:
+            tcpSocket: {port: 15002}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: "1", memory: 2Gi}
+            limits: {cpu: "1", memory: 2Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-connect
+  namespace: delta
+spec:
+  selector: {app: spark-connect}
+  ports:
+    - {name: connect, port: 15002}
+---
+# Only the writers reach the Spark Connect port. The executors the server starts reach the driver.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: spark-connect
+  namespace: delta
+spec:
+  podSelector:
+    matchLabels: {app: spark-connect}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {delta-writer: "true"}
+      ports:
+        - {port: 15002}
+    - from:
+        - podSelector:
+            matchLabels: {spark-role: executor}

@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# Terraform: the state holds passwords
+**/.terraform/
+**/.terraform.lock.hcl
+**/*.tfstate
+**/*.tfstate.backup
+**/*.tfvars
+**/*.tfvars.json
+
+# Credentials written by the tutorials
+**/kubeconfig
+**/lake.sql
+**/trino.key
+**/trino.pem
+**/password.db
+
+# Spark creates these in the current directory when it runs locally
+**/spark-warehouse/
+**/metastore_db/
+**/derby.log

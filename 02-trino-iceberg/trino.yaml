@@ -1,0 +1,235 @@
+# Trino: a coordinator, which plans the queries and talks to the clients, and workers, which run
+# them. More workers come with more replicas of the trino-worker deployment.
+#
+# Clients reach the coordinator over HTTPS, with a user and a password, through a LoadBalancer
+# Service: a load balancer dedicated to this cluster, with its own public addresses. The
+# coordinator and the workers talk to each other inside the cluster, signed with a shared secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-catalogs
+  namespace: lake
+data:
+  # The Iceberg tables, through the Lakekeeper catalogue. Trino reads and writes their files with
+  # the lake's Cellar keys.
+  iceberg.properties: |
+    connector.name=iceberg
+    iceberg.catalog.type=rest
+    iceberg.rest-catalog.uri=http://lakekeeper:8181/catalog
+    iceberg.rest-catalog.warehouse=lake
+    fs.native-s3.enabled=true
+    s3.endpoint=https://${ENV:CELLAR_HOST}
+    s3.region=us-east-1
+    s3.path-style-access=true
+    s3.aws-access-key=${ENV:CELLAR_KEY_ID}
+    s3.aws-secret-key=${ENV:CELLAR_KEY_SECRET}
+  # Sample data, generated on the fly: queries to try Trino without a table of your own.
+  tpch.properties: |
+    connector.name=tpch
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-coordinator
+  namespace: lake
+data:
+  config.properties: |
+    coordinator=true
+    node-scheduler.include-coordinator=false
+    http-server.http.port=8080
+    discovery.uri=http://trino:8080
+    internal-communication.shared-secret=${ENV:TRINO_SHARED_SECRET}
+    # Clients: HTTPS on 8443, with a password. Port 8080 serves the workers only.
+    http-server.https.enabled=true
+    http-server.https.port=8443
+    http-server.https.keystore.path=/etc/trino/tls/trino.pem
+    http-server.authentication.type=PASSWORD
+    # Ceilings on a query: it stops after 30 minutes, past 2 GB of memory on one worker, or past
+    # 8 GB in all. The workers' terminationGracePeriodSeconds follows max-execution-time.
+    query.max-execution-time=30m
+    query.max-memory=8GB
+    query.max-memory-per-node=2GB
+  # Queries go through resource groups: at most 20 at once, and 4 per user, the rest queued.
+  resource-groups.properties: |
+    resource-groups.configuration-manager=file
+    resource-groups.config-file=/etc/trino/resource-groups.json
+  resource-groups.json: |
+    {
+      "rootGroups": [{
+        "name": "global", "softMemoryLimit": "80%", "hardConcurrencyLimit": 20, "maxQueued": 100,
+        "subGroups": [{"name": "${USER}", "softMemoryLimit": "50%", "hardConcurrencyLimit": 4, "maxQueued": 20}]
+      }],
+      "selectors": [{"group": "global.${USER}"}]
+    }
+  password-authenticator.properties: |
+    password-authenticator.name=file
+    file.password-file=/etc/trino/users/password.db
+  # What each user may do. admin writes the lake. analyst only reads. Nobody writes to the
+  # business database. The first rule that matches a user and a catalogue applies.
+  access-control.properties: |
+    access-control.name=file
+    security.config-file=/etc/trino/rules.json
+  rules.json: |
+    {
+      "catalogs": [
+        {"user": "admin", "catalog": "business", "allow": "read-only"},
+        {"user": "admin", "allow": "all"},
+        {"user": "analyst", "allow": "read-only"}
+      ]
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trino-worker
+  namespace: lake
+data:
+  config.properties: |
+    coordinator=false
+    http-server.http.port=8080
+    discovery.uri=http://trino:8080
+    internal-communication.shared-secret=${ENV:TRINO_SHARED_SECRET}
+    query.max-memory-per-node=2GB
+    # A worker asked to stop finishes its running tasks first.
+    shutdown.grace-period=30s
+  # The default access control refuses the shutdown request of the workers' preStop hook. The
+  # coordinator checks every query against the rules of its own access control first.
+  access-control.properties: |
+    access-control.name=allow-all
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trino-coordinator
+  namespace: lake
+spec:
+  replicas: 1
+  # One coordinator, never two: the old one stops before the new one starts.
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: trino-coordinator}
+  template:
+    metadata:
+      labels: {app: trino-coordinator, lakekeeper-client: "true"}
+      # Karpenter never moves the coordinator: every running query goes through it.
+      annotations: {karpenter.sh/do-not-disrupt: "true"}
+    spec:
+      # On the fixed node, which Karpenter does not remove.
+      nodeSelector: {clever-cloud.com/nodegroup: system}
+      containers:
+        - name: trino
+          image: trinodb/trino:484
+          envFrom:
+            - secretRef: {name: trino}
+          ports:
+            - containerPort: 8080
+            - containerPort: 8443
+          volumeMounts:
+            - {name: catalogs, mountPath: /etc/trino/catalog}
+            - {name: config, mountPath: /etc/trino/config.properties, subPath: config.properties}
+            - {name: config, mountPath: /etc/trino/password-authenticator.properties, subPath: password-authenticator.properties}
+            - {name: config, mountPath: /etc/trino/resource-groups.properties, subPath: resource-groups.properties}
+            - {name: config, mountPath: /etc/trino/resource-groups.json, subPath: resource-groups.json}
+            - {name: config, mountPath: /etc/trino/access-control.properties, subPath: access-control.properties}
+            - {name: config, mountPath: /etc/trino/rules.json, subPath: rules.json}
+            - {name: tls, mountPath: /etc/trino/tls}
+            - {name: users, mountPath: /etc/trino/users}
+          readinessProbe:
+            httpGet: {path: /v1/info, port: 8080}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: "2", memory: 4Gi}
+            limits: {cpu: "2", memory: 4Gi}
+      volumes:
+        # The catalogues: the lake and the sample data, and the business database when
+        # trino-business.yaml is applied.
+        - name: catalogs
+          projected:
+            sources:
+              - configMap: {name: trino-catalogs}
+              - configMap: {name: trino-business, optional: true}
+        - name: config
+          configMap: {name: trino-coordinator}
+        - name: tls
+          secret: {secretName: trino-tls}
+        - name: users
+          secret: {secretName: trino-users}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trino-worker
+  namespace: lake
+spec:
+  # The HorizontalPodAutoscaler of trino-autoscaling.yaml sets the number of workers.
+  replicas: 1
+  selector:
+    matchLabels: {app: trino-worker}
+  template:
+    metadata:
+      labels: {app: trino-worker, lakekeeper-client: "true"}
+    spec:
+      # Room for the running queries to finish before the pod goes: the coordinator's
+      # query.max-execution-time (30 minutes) plus a minute. Change both together.
+      terminationGracePeriodSeconds: 1860
+      containers:
+        - name: trino
+          image: trinodb/trino:484
+          envFrom:
+            - secretRef: {name: trino}
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - {name: catalogs, mountPath: /etc/trino/catalog}
+            - {name: config, mountPath: /etc/trino/config.properties, subPath: config.properties}
+            - {name: config, mountPath: /etc/trino/access-control.properties, subPath: access-control.properties}
+          readinessProbe:
+            httpGet: {path: /v1/info, port: 8080}
+            periodSeconds: 10
+          # When the autoscaler removes a worker, it stops taking tasks, finishes the running ones, and
+          # exits: no query fails because a worker went away.
+          lifecycle:
+            preStop:
+              exec:
+                # If Trino refuses the request, the hook ends at once and the pod stops as usual.
+                command: ["sh", "-c", "code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -d '\"SHUTTING_DOWN\"' -H 'Content-Type: application/json' -H 'X-Trino-User: admin' http://localhost:8080/v1/info/state); [ \"$code\" = 200 ] || exit 0; while curl -sf http://localhost:8080/v1/info > /dev/null; do sleep 5; done"]
+          resources:
+            requests: {cpu: "2", memory: 4Gi}
+            limits: {cpu: "2", memory: 4Gi}
+      volumes:
+        - name: catalogs
+          projected:
+            sources:
+              - configMap: {name: trino-catalogs}
+              - configMap: {name: trino-business, optional: true}
+        - name: config
+          configMap: {name: trino-worker}
+---
+# Inside the cluster: the workers announce themselves to the coordinator here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: trino
+  namespace: lake
+spec:
+  selector: {app: trino-coordinator}
+  ports:
+    - {name: http, port: 8080}
+---
+# Only the coordinator and the other workers reach a worker. Its shutdown request, from its own
+# preStop hook, goes through localhost.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: trino-worker
+  namespace: lake
+spec:
+  podSelector:
+    matchLabels: {app: trino-worker}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: trino-coordinator}
+        - podSelector:
+            matchLabels: {app: trino-worker}

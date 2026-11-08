@@ -1,0 +1,18 @@
+[project]
+name = "ducklake-duckdb-server"
+version = "0.1.0"
+description = "DuckDB in server mode on Clever Cloud, serving a DuckLake lake on Cellar"
+requires-python = ">=3.13"
+dependencies = [
+    # Clients connect with the same version: files written by DuckDB 2.0 are not read by older ones.
+    "duckdb==2.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+pythonpath = ["."]
